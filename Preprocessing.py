@@ -10,6 +10,8 @@ from pathlib import Path
 import sys
 import warnings
 warnings.filterwarnings('ignore')
+import sys
+sys.stdout.reconfigure(encoding='utf-8')
 
 # ✅ FIXED MediaPipe import (stable)
 from mediapipe.python.solutions import face_detection as mp_face_detection
