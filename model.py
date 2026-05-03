@@ -5,19 +5,19 @@ import torchvision.models as models
 class DeepFakeDetector(nn.Module):
     def __init__(self, hidden_size=64, num_layers=1, num_classes=2):
         super(DeepFakeDetector, self).__init__()
-        
+
         # CNN Backbone
-        self.cnn = models.resnext50_32x4d(pretrained=True)
+        self.cnn = models.resnext50_32x4d(weights="DEFAULT")
         self.cnn = nn.Sequential(*list(self.cnn.children())[:-1])
-        
-        # Freeze CNN layers
+
+        # Freeze most layers
         for param in self.cnn.parameters():
             param.requires_grad = False
-        
-        # Unfreeze last layers
+
+        # Unfreeze last few layers
         for param in list(self.cnn.parameters())[-4:]:
             param.requires_grad = True
-        
+
         # LSTM
         self.lstm = nn.LSTM(
             input_size=2048,
@@ -25,25 +25,25 @@ class DeepFakeDetector(nn.Module):
             num_layers=num_layers,
             batch_first=True
         )
-        
+
         # Classifier
-        self.dropout = nn.Dropout(0.5)
+        self.dropout = nn.Dropout(0.5)   # FIXED
         self.fc = nn.Linear(hidden_size, num_classes)
-        
+
     def forward(self, x):
-        batch_size, seq_len, c, h, w = x.shape
-        
-        cnn_features = []
-        for t in range(seq_len):
-            frame_features = self.cnn(x[:, t])
-            frame_features = frame_features.view(batch_size, -1)
-            cnn_features.append(frame_features)
-        
-        cnn_seq = torch.stack(cnn_features, dim=1)
-        
-        lstm_out, (hidden, _) = self.lstm(cnn_seq)
-        
+        batch, seq, c, h, w = x.shape
+
+        features = []
+        for t in range(seq):
+            f = self.cnn(x[:, t])
+            f = f.view(batch, -1)
+            features.append(f)
+
+        x = torch.stack(features, dim=1)
+
+        _, (hidden, _) = self.lstm(x)
+
         out = self.dropout(hidden[-1])
         out = self.fc(out)
-        
+
         return out

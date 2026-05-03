@@ -1,63 +1,73 @@
-from torch.utils.data import Dataset, DataLoader
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
 import cv2
 import numpy as np
 from sklearn.metrics import accuracy_score, roc_auc_score
 
+from model import DeepFakeDetector
+
 # =========================
-# DATASET CLASS
+# CONFIG
 # =========================
-class VideoDataset(Dataset):
-    def __init__(self, data_path, sequence_length=20):
-        # Load videos from all subfolders
-        self.video_paths = list(Path(data_path).rglob("*.mp4"))
-        self.sequence_length = sequence_length
+SEQUENCE_LENGTH = 10   # reduced for speed
+IMAGE_SIZE = 112
+
+config = {
+    'batch_size': 4,
+    'epochs': 10,       # you can increase later
+    'learning_rate': 1e-4,
+    'weight_decay': 1e-4
+}
+
+# =========================
+# DATASET
+# =========================
+class CombinedDataset(Dataset):
+    def __init__(self, real_folder, fake_folder):
+        self.paths = list(Path(real_folder).glob("*.mp4")) + \
+                     list(Path(fake_folder).glob("*.mp4"))
 
     def __len__(self):
-        return len(self.video_paths)
+        return len(self.paths)
 
     def __getitem__(self, idx):
-        video_path = str(self.video_paths[idx])
+        path = str(self.paths[idx])
+        label = 0 if "real" in path.lower() else 1
 
-        cap = cv2.VideoCapture(video_path)
+        cap = cv2.VideoCapture(path)
         frames = []
 
-        while len(frames) < self.sequence_length:
+        while len(frames) < SEQUENCE_LENGTH:
             ret, frame = cap.read()
             if not ret:
                 break
 
-            frame = cv2.resize(frame, (112, 112))
+            frame = cv2.resize(frame, (IMAGE_SIZE, IMAGE_SIZE))
             frame = frame / 255.0
             frames.append(frame)
 
         cap.release()
 
         # Padding if video is short
-        while len(frames) < self.sequence_length:
-            frames.append(np.zeros((112, 112, 3)))
+        while len(frames) < SEQUENCE_LENGTH:
+            frames.append(np.zeros((IMAGE_SIZE, IMAGE_SIZE, 3)))
 
         frames = np.array(frames)
-        frames = np.transpose(frames, (0, 3, 1, 2))  # (seq, C, H, W)
-
-        # Label from folder name
-        if "fake" in video_path.lower():
-            label = 1
-        else:
-            label = 0
+        frames = np.transpose(frames, (0, 3, 1, 2))
 
         return torch.tensor(frames, dtype=torch.float32), torch.tensor(label)
 
 # =========================
 # TRAIN FUNCTION
 # =========================
-def train_model(model, train_loader, val_loader, config):
-
+def train():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = model.to(device)
+    print(f"Using device: {device}")
+
+    model = DeepFakeDetector().to(device)
 
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(
@@ -66,8 +76,27 @@ def train_model(model, train_loader, val_loader, config):
         weight_decay=config['weight_decay']
     )
 
+    # =========================
+    # LOAD DATA
+    # =========================
+    train_dataset = CombinedDataset(
+        "data/processed/train_real_faces",
+        "data/processed/train_fake_faces"
+    )
+
+    val_dataset = CombinedDataset(
+        "data/processed/test_real_faces",
+        "data/processed/test_fake_faces"
+    )
+
+    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False)
+
     best_auc = 0.0
 
+    # =========================
+    # TRAIN LOOP
+    # =========================
     for epoch in range(config['epochs']):
         model.train()
         total_loss = 0
@@ -77,63 +106,59 @@ def train_model(model, train_loader, val_loader, config):
 
             optimizer.zero_grad()
             outputs = model(frames)
-
             loss = criterion(outputs, labels)
+
             loss.backward()
             optimizer.step()
 
             total_loss += loss.item()
 
-        print(f"Epoch {epoch+1}, Loss: {total_loss:.4f}")
+        # ✅ FIXED LOSS (AVERAGE)
+        avg_loss = total_loss / len(train_loader)
 
-        # Validation
+        print(f"\nEpoch {epoch+1}, Avg Loss: {avg_loss:.4f}")
+
+        # =========================
+        # VALIDATION
+        # =========================
         model.eval()
-        all_preds, all_labels = [], []
+        all_preds = []
+        all_probs = []
+        all_labels = []
 
         with torch.no_grad():
             for frames, labels in val_loader:
                 frames, labels = frames.to(device), labels.to(device)
 
                 outputs = model(frames)
-                probs = torch.softmax(outputs, dim=1)[:, 1]
+                probs = torch.softmax(outputs, dim=1)
 
-                preds = torch.argmax(outputs, dim=1)
+                preds = torch.argmax(probs, dim=1)
 
                 all_preds.extend(preds.cpu().numpy())
+                all_probs.extend(probs[:, 1].cpu().numpy())
                 all_labels.extend(labels.cpu().numpy())
 
         acc = accuracy_score(all_labels, all_preds)
 
-        # AUC needs probabilities
+        # ✅ SAFE AUC (no crash)
         try:
-            auc = roc_auc_score(all_labels, all_preds)
+            auc = roc_auc_score(all_labels, all_probs)
         except:
             auc = 0.0
 
-        print(f"Epoch {epoch+1}: Val Acc={acc:.4f}, AUC={auc:.4f}")
+        print(f"Val Acc={acc:.4f}, AUC={auc:.4f}")
 
+        # =========================
+        # SAVE BEST MODEL
+        # =========================
         if auc > best_auc:
             best_auc = auc
             torch.save(model.state_dict(), f"models/best_model_epoch_{epoch+1}.pth")
+            print("✅ Best model saved!")
 
 # =========================
-# MAIN
+# RUN
 # =========================
 if __name__ == "__main__":
-    from model import DeepFakeDetector
-
-    config = {
-        'epochs': 3,
-        'learning_rate': 1e-4,
-        'weight_decay': 1e-4
-    }
-
-    train_dataset = VideoDataset("data/processed/")
-    val_dataset = VideoDataset("data/processed/")
-
-    train_loader = DataLoader(train_dataset, batch_size=2, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=2)
-
-    model = DeepFakeDetector()
-
-    train_model(model, train_loader, val_loader, config)
+    train()
